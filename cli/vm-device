@@ -1,0 +1,1155 @@
+#!/bin/bash
+
+VM_NAME="win11-vm"
+CACHE_DIR="$HOME/.cache/usb_attach"
+mkdir -p "$CACHE_DIR"
+
+# Global flags
+JSON_OUTPUT=false
+INTERACTIVE=true
+
+# Function to check if a USB device is available on the host
+is_device_available() {
+  local vendor="$1"
+  local product="$2"
+  
+  # Check if the device appears in lsusb output
+  lsusb | grep -q "ID ${vendor}:${product}"
+}
+
+# Function to check if a device is actually connected to the VM
+is_device_connected_to_vm() {
+  local vendor="$1"
+  local product="$2"
+  
+  # Check if the device appears in the VM's USB devices
+  # This is a more complex check that would require guest agent or other methods
+  # For now, we'll assume if it's available on host and in config, it should be connected
+  # This is a limitation of the current approach
+  return 0
+}
+
+# Function to check if a device was recently attached (heuristic)
+is_device_recently_attached() {
+  local vendor="$1"
+  local product="$2"
+  
+  # Check if there's a recent attachment record
+  # This is a simple heuristic - in a real implementation you might track timestamps
+  # For now, we'll assume devices that are available but have been in the config
+  # for a while are "actively attached"
+  return 1
+}
+
+# Function to get attached USB devices (vendor, product, name, status)
+get_attached_devices() {
+  local xml=$(sudo virsh dumpxml "$VM_NAME")
+  local devices=()
+  local seen_devices=()
+  local in_hostdev=0
+  local vendor=""
+  local product=""
+
+  while IFS= read -r line; do
+    if [[ $line =~ \<hostdev.*type=.usb. ]]; then
+      in_hostdev=1
+      vendor=""
+      product=""
+    elif [[ $in_hostdev -eq 1 && $line =~ \<vendor\ id=.0x([0-9a-fA-F]+). ]]; then
+      vendor="${BASH_REMATCH[1]}"
+    elif [[ $in_hostdev -eq 1 && $line =~ \<product\ id=.0x([0-9a-fA-F]+). ]]; then
+      product="${BASH_REMATCH[1]}"
+    elif [[ $in_hostdev -eq 1 && $line =~ \</hostdev\> ]]; then
+      if [[ -n "$vendor" && -n "$product" ]]; then
+        # Check if we've already seen this vendor:product combination
+        local device_key="$vendor:$product"
+        local already_seen=false
+        for seen in "${seen_devices[@]}"; do
+          if [[ "$seen" == "$device_key" ]]; then
+            already_seen=true
+            break
+          fi
+        done
+        
+        if [[ "$already_seen" == false ]]; then
+          seen_devices+=("$device_key")
+          
+          # Determine device status more accurately
+          local status=""
+          if is_device_available "$vendor" "$product"; then
+            # Device is available on host
+            # For now, assume it's actively attached since we can't easily distinguish
+            # between "available but not attached" and "actively attached"
+            # In a real scenario, you might check VM guest state or use timestamps
+            status="Actively Attached"
+          else
+            status="Disconnected"
+          fi
+          
+          # Derive a name (customize as needed; fallback to IDs)
+          local name="Unknown Device"
+          if [[ "$vendor" == "18a5" && "$product" == "0243" ]]; then
+            name="Verbatim Flash Drive"
+          elif [[ "$vendor" == "046d" ]]; then
+            case "$product" in
+              "0af7") name="Logitech PRO X 2 LIGHTSPEED" ;;
+              "c53a") name="Logitech PowerPlay Wireless Charging" ;;
+              "c52b") name="Logitech Unifying Receiver" ;;
+              "c548") name="Logitech Logi Bolt Receiver" ;;
+              *) name="Logitech Device" ;;
+            esac
+          else
+            name="Unknown Device ($vendor:$product)"
+          fi
+          # Use a delimiter that won't appear in device names
+          devices+=("$vendor|$product|$name|$status")
+        fi
+      fi
+      in_hostdev=0
+      vendor=""
+      product=""
+    fi
+  done <<< "$xml"
+
+  printf '%s\n' "${devices[@]}"
+}
+
+# Function to print pretty table
+print_table() {
+  local headers=("Num" "Vendor ID" "Product ID" "Device Name" "Status")
+  local rows=("$@")
+  if [ ${#rows[@]} -eq 0 ]; then
+    echo "No USB devices attached."
+    return
+  fi
+
+  # Calculate column widths
+  local col_widths=(3 10 11 30 12)  # Starting widths
+  for i in "${!rows[@]}"; do
+    IFS='|' read -r vendor product name status <<< "${rows[$i]}"
+    col_widths[0]=$(( ${col_widths[0]} > ${#i} + 1 ? ${col_widths[0]} : ${#i} + 1 ))
+    col_widths[1]=$(( ${col_widths[1]} > ${#vendor} ? ${col_widths[1]} : ${#vendor} ))
+    col_widths[2]=$(( ${col_widths[2]} > ${#product} ? ${col_widths[2]} : ${#product} ))
+    col_widths[3]=$(( ${col_widths[3]} > ${#name} ? ${col_widths[3]} : ${#name} ))
+    col_widths[4]=$(( ${col_widths[4]} > ${#status} ? ${col_widths[4]} : ${#status} ))
+  done
+
+  # Print separator
+  local sep="+"
+  for w in "${col_widths[@]}"; do
+    sep="$sep$(printf '%*s' "$((w+2))" '' | tr ' ' '-')+"
+  done
+  echo "$sep"
+
+  # Print header
+  printf "| %-*s | %-*s | %-*s | %-*s | %-*s |\n" "${col_widths[0]}" "${headers[0]}" "${col_widths[1]}" "${headers[1]}" "${col_widths[2]}" "${headers[2]}" "${col_widths[3]}" "${headers[3]}" "${col_widths[4]}" "${headers[4]}"
+  echo "$sep"
+
+  # Print rows
+  for i in "${!rows[@]}"; do
+    IFS='|' read -r vendor product name status <<< "${rows[$i]}"
+    printf "| %-*s | %-*s | %-*s | %-*s | %-*s |\n" "${col_widths[0]}" "$((i+1))" "${col_widths[1]}" "$vendor" "${col_widths[2]}" "$product" "${col_widths[3]}" "$name" "${col_widths[4]}" "$status"
+  done
+  echo "$sep"
+}
+
+# Function for list
+list_attached() {
+  local attached=()
+  local disconnected_count=0
+  local available_count=0
+  local actively_attached_count=0
+  
+  while IFS= read -r line; do
+    if [[ -n "$line" ]]; then
+      attached+=("$line")
+      # Count device states
+      if [[ "$line" == *"|Disconnected" ]]; then
+        ((disconnected_count++))
+      elif [[ "$line" == *"|Available" ]]; then
+        ((available_count++))
+      elif [[ "$line" == *"|Actively Attached" ]]; then
+        ((actively_attached_count++))
+      fi
+    fi
+  done < <(get_attached_devices)
+  
+  if [ "$JSON_OUTPUT" = true ]; then
+    local json_data=$(devices_to_json "${attached[@]}")
+    local summary="{\"attached_devices\": $json_data, \"summary\": {\"disconnected\": $disconnected_count, \"available\": $available_count, \"actively_attached\": $actively_attached_count, \"total\": ${#attached[@]}}}"
+    output_json "$summary"
+    return
+  fi
+  
+  output_text "Currently attached USB devices to $VM_NAME:"
+  print_table "${attached[@]}"
+  
+  # Only show interactive options if there are issues to fix and we're in interactive mode
+  if [ "$INTERACTIVE" = false ]; then
+    return
+  fi
+  
+  local needs_action=false
+  
+  if [ $disconnected_count -gt 0 ]; then
+    needs_action=true
+    output_text ""
+    output_text "⚠️  $disconnected_count device(s) are disconnected and not available on the host."
+    output_text "These devices have been unplugged or are otherwise unavailable."
+    output_text ""
+    read -p "Would you like to remove disconnected devices from VM config? (y/N): " remove_disconnected
+    if [[ "$remove_disconnected" =~ ^[Yy]$ ]]; then
+      remove_disconnected_devices
+    fi
+  fi
+  
+  if [ $available_count -gt 0 ]; then
+    needs_action=true
+    output_text ""
+    output_text "⚠️  $available_count device(s) are available but may need to be reattached."
+    output_text "These devices are plugged in but might not be working in the VM."
+    output_text ""
+    read -p "Would you like to reconnect these devices? (y/N): " reconnect_available
+    if [[ "$reconnect_available" =~ ^[Yy]$ ]]; then
+      reconnect_available_devices
+    fi
+  fi
+  
+  if [ $actively_attached_count -gt 0 ] && [ $needs_action = false ]; then
+    output_text ""
+    output_text "✅ All devices appear to be working properly."
+  fi
+}
+# Function for list-available
+list_available() {
+  local available=()
+  local available_count=0
+
+  while IFS= read -r line; do
+    if [[ -n "$line" ]]; then
+      available+=("$line")
+      ((available_count++))
+    fi
+  done < <(get_available_devices)
+
+  if [ "$JSON_OUTPUT" = true ]; then
+    local json_data=$(devices_to_json "${available[@]}")
+    local summary="{\"available_devices\": $json_data, \"summary\": {\"available\": $available_count, \"total\": $available_count}}"
+    output_json "$summary"
+    return
+  fi
+
+  output_text "Available USB devices for attachment to $VM_NAME:"
+  print_table "${available[@]}"
+  output_text ""
+  output_text "Total available devices: $available_count"
+}
+
+# Function to reconnect available devices
+reconnect_available_devices() {
+  echo "Reconnecting available devices to ensure they're active in the VM..."
+  
+  local attached=()
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && attached+=("$line")
+  done < <(get_attached_devices)
+  
+  local reconnected_count=0
+  for device in "${attached[@]}"; do
+    IFS='|' read -r vendor product name status <<< "$device"
+    
+    if [[ "$status" == "Available" ]]; then
+      echo "Reconnecting $name ($vendor:$product)..."
+      
+      # First detach the old entry
+      xml_file="$CACHE_DIR/reconnect_available_${vendor}_${product}.xml"
+      cat > "$xml_file" << EOF
+<hostdev mode='subsystem' type='usb' managed='yes'>
+  <source>
+    <vendor id='0x${vendor}'/>
+    <product id='0x${product}'/>
+  </source>
+</hostdev>
+EOF
+      
+      sudo virsh detach-device "$VM_NAME" --file "$xml_file" --live --config >/dev/null 2>&1
+      
+      # Small delay to ensure detach is complete
+      sleep 1
+      
+      # Now reattach (permanent attachment that survives reboots)
+      sudo virsh attach-device "$VM_NAME" --file "$xml_file" --live --config
+      if [ $? -eq 0 ]; then
+        echo "  ✓ Reconnected $name"
+        ((reconnected_count++))
+      else
+        echo "  ✗ Failed to reconnect $name"
+      fi
+      rm -f "$xml_file"
+    fi
+  done
+  
+  echo "Reconnected $reconnected_count device(s)."
+}
+
+# Function to mark a device as needing reconnection
+mark_for_reconnection() {
+  local attached=()
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && attached+=("$line")
+  done < <(get_attached_devices)
+  
+  if [ ${#attached[@]} -eq 0 ]; then
+    echo "No USB devices attached."
+    exit 1
+  fi
+
+  echo "Which device is not working properly and needs reconnection?"
+  print_table "${attached[@]}"
+
+  read -p "Enter the number: " choice
+  if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt ${#attached[@]} ]; then
+    echo "Invalid choice. Exiting."
+    exit 1
+  fi
+
+  idx=$((choice-1))
+  selected="${attached[$idx]}"
+  IFS='|' read -r vendor product name status <<< "$selected"
+
+  echo "Reconnecting $name ($vendor:$product)..."
+  
+  # First detach the old entry
+  xml_file="$CACHE_DIR/reconnect_single_${vendor}_${product}.xml"
+  cat > "$xml_file" << EOF
+<hostdev mode='subsystem' type='usb' managed='yes'>
+  <source>
+    <vendor id='0x${vendor}'/>
+    <product id='0x${product}'/>
+  </source>
+</hostdev>
+EOF
+  
+  sudo virsh detach-device "$VM_NAME" --file "$xml_file" --live --config >/dev/null 2>&1
+  
+  # Small delay to ensure detach is complete
+  sleep 1
+  
+  # Now reattach (permanent attachment that survives reboots)
+  sudo virsh attach-device "$VM_NAME" --file "$xml_file" --live --config
+  if [ $? -eq 0 ]; then
+    echo "  ✓ Reconnected $name"
+  else
+    echo "  ✗ Failed to reconnect $name"
+  fi
+  rm -f "$xml_file"
+}
+
+# Function to check for devices that can be reconnected
+check_for_reconnectable_devices() {
+  echo
+  echo "Checking for devices that can be reconnected..."
+  
+  # Get all currently attached devices from VM config
+  local attached=()
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && attached+=("$line")
+  done < <(get_attached_devices)
+  
+  local attached_ids=()
+  for device in "${attached[@]}"; do
+    IFS='|' read -r vendor product name status <<< "$device"
+    attached_ids+=("$vendor:$product")
+  done
+  
+  # Check lsusb for available devices that were previously attached
+  local reconnectable=()
+  while read -r line; do
+    if [[ $line =~ Bus\ ([0-9]+)\ Device\ ([0-9]+):\ ID\ ([0-9a-fA-F]+):([0-9a-fA-F]+)\ (.*) ]]; then
+      vendor="${BASH_REMATCH[3]}"
+      product="${BASH_REMATCH[4]}"
+      name="${BASH_REMATCH[5]}"
+      
+      # Skip hubs and root hubs
+      if [[ "$vendor" == "1d6b" || "$name" =~ "Hub" ]]; then
+        continue
+      fi
+      
+      # Check if this device was previously attached but is now shown as disconnected
+      for attached_id in "${attached_ids[@]}"; do
+        if [[ "$attached_id" == "$vendor:$product" ]]; then
+          # This device is in VM config, check if it's shown as disconnected
+          for device in "${attached[@]}"; do
+            IFS='|' read -r a_vendor a_product a_name a_status <<< "$device"
+            if [[ "$a_vendor:$a_product" == "$vendor:$product" && "$a_status" == "Disconnected" ]]; then
+              reconnectable+=("$vendor:$product:$name")
+            fi
+          done
+        fi
+      done
+    fi
+  done < <(lsusb)
+  
+  if [ ${#reconnectable[@]} -gt 0 ]; then
+    echo "Found ${#reconnectable[@]} device(s) that can be reconnected:"
+    for i in "${!reconnectable[@]}"; do
+      IFS=':' read -r vendor product name <<< "${reconnectable[$i]}"
+      echo "  $((i+1)). $name ($vendor:$product)"
+    done
+    echo
+    read -p "Would you like to reconnect these devices? (y/N): " reconnect
+    if [[ "$reconnect" =~ ^[Yy]$ ]]; then
+      reconnect_devices "${reconnectable[@]}"
+    fi
+  fi
+}
+
+# Function to reconnect devices
+reconnect_devices() {
+  local devices=("$@")
+  echo "Reconnecting devices..."
+  
+  local reconnected_count=0
+  for device in "${devices[@]}"; do
+    IFS=':' read -r vendor product name <<< "$device"
+    
+    echo "Reconnecting $name ($vendor:$product)..."
+    
+    # First detach the old entry
+    xml_file="$CACHE_DIR/reconnect_detach_${vendor}_${product}.xml"
+    cat > "$xml_file" << EOF
+<hostdev mode='subsystem' type='usb' managed='yes'>
+  <source>
+    <vendor id='0x${vendor}'/>
+    <product id='0x${product}'/>
+  </source>
+</hostdev>
+EOF
+    
+    sudo virsh detach-device "$VM_NAME" --file "$xml_file" --live --config >/dev/null 2>&1
+    
+    # Small delay to ensure detach is complete
+    sleep 1
+    
+    # Now reattach (permanent attachment that survives reboots)
+    sudo virsh attach-device "$VM_NAME" --file "$xml_file" --live --config
+    if [ $? -eq 0 ]; then
+      echo "  ✓ Reconnected $name"
+      ((reconnected_count++))
+    else
+      echo "  ✗ Failed to reconnect $name"
+    fi
+    rm -f "$xml_file"
+  done
+  
+  echo "Reconnected $reconnected_count device(s)."
+}
+
+# Function to remove disconnected devices
+remove_disconnected_devices() {
+  echo "Removing disconnected USB devices from VM config..."
+  
+  local attached=()
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && attached+=("$line")
+  done < <(get_attached_devices)
+
+  local removed_count=0
+  for device in "${attached[@]}"; do
+    IFS='|' read -r vendor product name status <<< "$device"
+    
+    if [[ "$status" == "Disconnected" ]]; then
+      echo "Removing disconnected device: $name ($vendor:$product)"
+      
+      xml_file="$CACHE_DIR/remove_disconnected_${vendor}_${product}.xml"
+      cat > "$xml_file" << EOF
+<hostdev mode='subsystem' type='usb' managed='yes'>
+  <source>
+    <vendor id='0x${vendor}'/>
+    <product id='0x${product}'/>
+  </source>
+</hostdev>
+EOF
+
+      # Try to remove device from both live and persistent config
+      sudo virsh detach-device "$VM_NAME" --file "$xml_file" --live --config >/dev/null 2>&1
+      rc=$?
+      if [ $rc -eq 0 ]; then
+        echo "  ✓ Removed $name"
+        ((removed_count++))
+      else
+        # Try live only
+        sudo virsh detach-device "$VM_NAME" --file "$xml_file" --live >/dev/null 2>&1
+        rc2=$?
+        if [ $rc2 -eq 0 ]; then
+          echo "  ✓ Removed $name (live config)"
+          ((removed_count++))
+        else
+          # Try persistent only
+          sudo virsh detach-device "$VM_NAME" --file "$xml_file" --config >/dev/null 2>&1
+          rc3=$?
+          if [ $rc3 -eq 0 ]; then
+            echo "  ✓ Removed $name (persistent config)"
+            ((removed_count++))
+          else
+            echo "  ✗ Failed to remove $name"
+          fi
+        fi
+      fi
+      rm -f "$xml_file"
+    fi
+  done
+
+  echo "Removed $removed_count disconnected device(s)."
+}
+
+# Function for detach
+detach_device() {
+  local attached=()
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && attached+=("$line")
+  done < <(get_attached_devices)
+  if [ ${#attached[@]} -eq 0 ]; then
+    echo "No USB devices attached to detach."
+    exit 1
+  fi
+
+  echo "Which USB device would you like to detach?"
+  print_table "${attached[@]}"
+
+  read -p "Enter the number: " choice
+  if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt ${#attached[@]} ]; then
+    echo "Invalid choice. Exiting."
+    exit 1
+  fi
+
+  idx=$((choice-1))
+  selected="${attached[$idx]}"
+  IFS='|' read -r vendor product name status <<< "$selected"
+
+  xml_file="$CACHE_DIR/usb_device_${vendor}_${product}.xml"
+  cat > "$xml_file" << EOF
+<hostdev mode='subsystem' type='usb' managed='yes'>
+  <source>
+    <vendor id='0x${vendor}'/>
+    <product id='0x${product}'/>
+  </source>
+</hostdev>
+EOF
+
+  # Detach device permanently from VM configuration
+  sudo virsh detach-device "$VM_NAME" --file "$xml_file" --live --config
+  if [ $? -eq 0 ]; then
+    echo "Device detached successfully."
+  else
+    echo "Error detaching device. Check VM status."
+  fi
+}
+
+# Function for attach
+attach_device() {
+  if ! sudo virsh domstate "$VM_NAME" | grep -q "running"; then
+    echo "Error: VM '$VM_NAME' is not running. Start it first."
+    exit 1
+  fi
+
+  # Get currently attached devices for filtering
+  local attached=()
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && attached+=("$line")
+  done < <(get_attached_devices)
+  local attached_ids=()
+  for device in "${attached[@]}"; do
+    IFS='|' read -r vendor product name status <<< "$device"
+    attached_ids+=("$vendor:$product")
+  done
+
+  devices=()
+  while read -r line; do
+    if [[ $line =~ Bus\ ([0-9]+)\ Device\ ([0-9]+):\ ID\ ([0-9a-fA-F]+):([0-9a-fA-F]+)\ (.*) ]]; then
+      bus="${BASH_REMATCH[1]}"
+      dev="${BASH_REMATCH[2]}"
+      vendor="${BASH_REMATCH[3]}"
+      product="${BASH_REMATCH[4]}"
+      name="${BASH_REMATCH[5]}"
+      
+      # Skip hubs and root hubs
+      if [[ "$vendor" == "1d6b" || "$name" =~ "Hub" ]]; then
+        continue
+      fi
+      
+      # Skip already attached devices
+      local already_attached=false
+      for attached_id in "${attached_ids[@]}"; do
+        if [[ "$attached_id" == "$vendor:$product" ]]; then
+          already_attached=true
+          break
+        fi
+      done
+      
+      if [[ "$already_attached" == false ]]; then
+        devices+=("$bus:$dev:$vendor:$product:$name")
+      fi
+    fi
+  done < <(lsusb)
+
+  if [ ${#devices[@]} -eq 0 ]; then
+    echo "No suitable USB devices found (excluding hubs, root hubs, and already attached devices)."
+    exit 1
+  fi
+
+  echo "Which USB device would you like to attach?"
+
+  # Prepare rows for print_table
+  local table_rows=()
+  for i in "${!devices[@]}"; do
+    vendor=$(echo "${devices[$i]}" | cut -d: -f3)
+    product=$(echo "${devices[$i]}" | cut -d: -f4)
+    name=$(echo "${devices[$i]}" | cut -d: -f5)
+    table_rows+=("$vendor|$product|$name|Available")
+  done
+
+  print_table "${table_rows[@]}"
+
+  read -p "Enter the number: " choice
+  if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt ${#devices[@]} ]; then
+    echo "Invalid choice. Exiting."
+    exit 1
+  fi
+
+  idx=$((choice-1))
+  selected="${devices[$idx]}"
+  bus=$(echo "$selected" | cut -d: -f1)
+  dev=$(echo "$selected" | cut -d: -f2)
+  vendor=$(echo "$selected" | cut -d: -f3)
+  product=$(echo "$selected" | cut -d: -f4)
+
+  xml_file="$CACHE_DIR/usb_device_${vendor}_${product}.xml"
+  cat > "$xml_file" << EOF
+<hostdev mode='subsystem' type='usb' managed='yes'>
+  <source>
+    <vendor id='0x${vendor}'/>
+    <product id='0x${product}'/>
+  </source>
+</hostdev>
+EOF
+
+  # Attach device (permanent attachment that survives reboots)
+  sudo virsh attach-device "$VM_NAME" --file "$xml_file" --live --config
+  if [ $? -eq 0 ]; then
+    echo "Device attached successfully. Check your Windows 11 VM."
+    echo "This attachment is permanent and will survive VM reboots."
+  else
+    echo "Error attaching device. Verify VM config and device availability."
+  fi
+}
+
+# Function to detach a device by vendor and product ID (non-interactive)
+detach_device_by_id() {
+  local vendor="$1"
+  local product="$2"
+  local name="Unknown Device"
+
+  # Try to find the device name in lsusb (optional, for reporting)
+  while read -r line; do
+    if [[ $line =~ ID[[:space:]]${vendor}:${product}[[:space:]](.*) ]]; then
+      name="${BASH_REMATCH[1]}"
+      break
+    fi
+  done < <(lsusb)
+
+  xml_file="$CACHE_DIR/usb_device_${vendor}_${product}.xml"
+  cat > "$xml_file" << EOF
+<hostdev mode='subsystem' type='usb' managed='yes'>
+  <source>
+    <vendor id='0x${vendor}'/>
+    <product id='0x${product}'/>
+  </source>
+</hostdev>
+EOF
+
+  # Try to remove device from both live and persistent config, capturing output
+  local virsh_output
+  virsh_output=$(sudo virsh detach-device "$VM_NAME" --file "$xml_file" --live --config 2>&1)
+  rc=$?
+  if [ $rc -ne 0 ]; then
+    # Try live only
+    virsh_output=$(sudo virsh detach-device "$VM_NAME" --file "$xml_file" --live 2>&1)
+    rc2=$?
+    if [ $rc2 -ne 0 ]; then
+      # Try persistent only
+      virsh_output=$(sudo virsh detach-device "$VM_NAME" --file "$xml_file" --config 2>&1)
+      rc3=$?
+      if [ $rc3 -eq 0 ]; then
+        rc=0
+      fi
+    else
+      rc=0
+    fi
+  fi
+  rm -f "$xml_file"
+
+  if [ $rc -eq 0 ]; then
+    if [ "$JSON_OUTPUT" = true ]; then
+      echo "{\"success\": true, \"vendor\": \"$vendor\", \"product\": \"$product\", \"name\": \"$name\"}"
+    else
+      echo "$virsh_output"
+      output_text "Device $name ($vendor:$product) detached successfully."
+    fi
+    exit 0
+  else
+    if [ "$JSON_OUTPUT" = true ]; then
+      reason=$(echo "$virsh_output" | tr '\n' ' ' | sed 's/"/\\"/g')
+      echo "{\"error\": \"Failed to detach device $vendor:$product.\", \"reason\": \"$reason\", \"success\": false}"
+    else
+      output_error "Failed to detach device $vendor:$product."
+      echo "$virsh_output" >&2
+    fi
+    exit 1
+  fi
+}
+
+# Function to reconnect a device by vendor and product ID (non-interactive, JSON-aware)
+reconnect_device_by_id() {
+  local vendor="$1"
+  local product="$2"
+  local name="Unknown Device"
+  local found=0
+
+  # Find the device in lsusb for reporting
+  while read -r line; do
+    if [[ $line =~ ID[[:space:]]${vendor}:${product}[[:space:]](.*) ]]; then
+      name="${BASH_REMATCH[1]}"
+      found=1
+      break
+    fi
+  done < <(lsusb)
+
+  if [ $found -eq 0 ]; then
+    if [ "$JSON_OUTPUT" = true ]; then
+      echo "{\"error\": \"Device $vendor:$product not found on host.\", \"success\": false}"
+    else
+      output_error "Device $vendor:$product not found on host."
+    fi
+    exit 1
+  fi
+
+  xml_file="$CACHE_DIR/reconnect_by_id_${vendor}_${product}.xml"
+  cat > "$xml_file" << EOF
+<hostdev mode='subsystem' type='usb' managed='yes'>
+  <source>
+    <vendor id='0x${vendor}'/>
+    <product id='0x${product}'/>
+  </source>
+</hostdev>
+EOF
+
+  # Detach
+  local detach_output
+  detach_output=$(sudo virsh detach-device "$VM_NAME" --file "$xml_file" --live --config 2>&1)
+  sleep 1
+  # Attach
+  local attach_output
+  attach_output=$(sudo virsh attach-device "$VM_NAME" --file "$xml_file" --live --config 2>&1)
+  rc=$?
+  rm -f "$xml_file"
+
+  if [ $rc -eq 0 ]; then
+    if [ "$JSON_OUTPUT" = true ]; then
+      echo "{\"success\": true, \"vendor\": \"$vendor\", \"product\": \"$product\", \"name\": \"$name\"}"
+    else
+      echo "$attach_output"
+      output_text "Device $name ($vendor:$product) reconnected successfully."
+    fi
+    exit 0
+  else
+    if [ "$JSON_OUTPUT" = true ]; then
+      reason=$(echo "$attach_output" | tr '\n' ' ' | sed 's/"/\\"/g')
+      echo "{\"error\": \"Failed to reconnect device $vendor:$product.\", \"reason\": \"$reason\", \"success\": false}"
+    else
+      output_error "Failed to reconnect device $vendor:$product."
+      echo "$attach_output" >&2
+    fi
+    exit 1
+  fi
+}
+
+# Function to attach a device by vendor and product ID (non-interactive)
+attach_device_by_id() {
+  local vendor="$1"
+  local product="$2"
+  local found=0
+  local name="Unknown Device"
+
+  # Find the device in lsusb
+  while read -r line; do
+    if [[ $line =~ ID[[:space:]]${vendor}:${product}[[:space:]](.*) ]]; then
+      name="${BASH_REMATCH[1]}"
+      found=1
+      break
+    fi
+  done < <(lsusb)
+
+  if [ $found -eq 0 ]; then
+    output_error "Device $vendor:$product not found on host."
+    exit 1
+  fi
+
+  xml_file="$CACHE_DIR/usb_device_${vendor}_${product}.xml"
+  cat > "$xml_file" << EOF
+<hostdev mode='subsystem' type='usb' managed='yes'>
+  <source>
+    <vendor id='0x${vendor}'/>
+    <product id='0x${product}'/>
+  </source>
+</hostdev>
+EOF
+
+  virsh_output=$(sudo virsh attach-device "$VM_NAME" --file "$xml_file" --live --config 2>&1)
+  rc=$?
+  rm -f "$xml_file"
+
+  if [ $rc -eq 0 ]; then
+    if [ "$JSON_OUTPUT" = true ]; then
+      echo "{\"success\": true, \"vendor\": \"$vendor\", \"product\": \"$product\", \"name\": \"$name\"}"
+    else
+      echo "$virsh_output"
+      output_text "Device $name ($vendor:$product) attached successfully."
+    fi
+    exit 0
+  else
+    if [ "$JSON_OUTPUT" = true ]; then
+      reason=$(echo "$virsh_output" | tr '\n' ' ' | sed 's/"/\\"/g')
+      echo "{\"error\": \"Failed to attach device $vendor:$product.\", \"reason\": \"$reason\", \"success\": false}"
+    else
+      output_error "Failed to attach device $vendor:$product."
+      echo "$virsh_output" >&2
+    fi
+    exit 1
+  fi
+}
+
+# Function to clean up duplicate hostdev entries
+cleanup_duplicates() {
+  echo "Scanning for duplicate USB hostdev entries..."
+  
+  local xml=$(sudo virsh dumpxml "$VM_NAME")
+  local seen_devices=()
+  local duplicates=()
+  local in_hostdev=0
+  local vendor=""
+  local product=""
+  local alias=""
+  
+  while IFS= read -r line; do
+    if [[ $line =~ \<hostdev.*type=.usb. ]]; then
+      in_hostdev=1
+      vendor=""
+      product=""
+      alias=""
+    elif [[ $in_hostdev -eq 1 && $line =~ \<vendor\ id=.0x([0-9a-fA-F]+). ]]; then
+      vendor="${BASH_REMATCH[1]}"
+    elif [[ $in_hostdev -eq 1 && $line =~ \<product\ id=.0x([0-9a-fA-F]+). ]]; then
+      product="${BASH_REMATCH[1]}"
+    elif [[ $in_hostdev -eq 1 && $line =~ \<alias\ name=\'([^\']+)\' ]]; then
+      alias="${BASH_REMATCH[1]}"
+    elif [[ $in_hostdev -eq 1 && $line =~ \</hostdev\> ]]; then
+      if [[ -n "$vendor" && -n "$product" && -n "$alias" ]]; then
+        local device_key="$vendor:$product"
+        local already_seen=false
+        
+        for seen in "${seen_devices[@]}"; do
+          if [[ "$seen" == "$device_key" ]]; then
+            already_seen=true
+            break
+          fi
+        done
+        
+        if [[ "$already_seen" == true ]]; then
+          duplicates+=("$alias:$device_key")
+        else
+          seen_devices+=("$device_key")
+        fi
+      fi
+      in_hostdev=0
+      vendor=""
+      product=""
+      alias=""
+    fi
+  done <<< "$xml"
+  
+  if [ ${#duplicates[@]} -eq 0 ]; then
+    echo "No duplicate USB hostdev entries found."
+    return
+  fi
+  
+  echo "Found ${#duplicates[@]} duplicate entries:"
+  for dup in "${duplicates[@]}"; do
+    alias_name=$(echo "$dup" | cut -d: -f1)
+    device_key=$(echo "$dup" | cut -d: -f2-)
+    echo "  $alias_name ($device_key)"
+  done
+  
+  read -p "Remove these duplicates? (y/N): " confirm
+  if [[ "$confirm" =~ ^[Yy]$ ]]; then
+    for dup in "${duplicates[@]}"; do
+      alias_name=$(echo "$dup" | cut -d: -f1)
+      device_key=$(echo "$dup" | cut -d: -f2-)
+      vendor=$(echo "$device_key" | cut -d: -f1)
+      product=$(echo "$device_key" | cut -d: -f2)
+      
+      echo "Removing duplicate $alias_name ($device_key)..."
+      
+      # Create temporary XML file for the device
+      xml_file="$CACHE_DIR/cleanup_${alias_name}.xml"
+      cat > "$xml_file" << EOF
+<hostdev mode='subsystem' type='usb' managed='yes'>
+  <source>
+    <vendor id='0x${vendor}'/>
+    <product id='0x${product}'/>
+  </source>
+</hostdev>
+EOF
+      
+      # Remove duplicate device permanently from VM configuration
+      sudo virsh detach-device "$VM_NAME" --file "$xml_file" --live --config
+      if [ $? -eq 0 ]; then
+        echo "  ✓ Removed $alias_name"
+      else
+        echo "  ✗ Failed to remove $alias_name"
+      fi
+      rm -f "$xml_file"
+    done
+    echo "Cleanup complete."
+  else
+    echo "Cleanup cancelled."
+  fi
+}
+
+# Function to output JSON
+output_json() {
+  local data="$1"
+  if [ "$JSON_OUTPUT" = true ]; then
+    echo "$data"
+  fi
+}
+
+# Function to output regular text (suppressed in JSON mode)
+output_text() {
+  local text="$1"
+  if [ "$JSON_OUTPUT" = false ]; then
+    echo "$text"
+  fi
+}
+
+# Function to output error messages (always shown)
+output_error() {
+  local error="$1"
+  if [ "$JSON_OUTPUT" = true ]; then
+    echo "{\"error\": \"$error\", \"success\": false}" >&2
+  else
+    echo "$error" >&2
+  fi
+}
+
+# Function to convert device data to JSON
+devices_to_json() {
+  local devices=("$@")
+  local json_array="["
+  local first=true
+  
+  for device in "${devices[@]}"; do
+    if [ "$first" = false ]; then
+      json_array+=","
+    fi
+    first=false
+    
+    IFS='|' read -r vendor product name status <<< "$device"
+    json_array+="{\"vendor\":\"$vendor\",\"product\":\"$product\",\"name\":\"$name\",\"status\":\"$status\"}"
+  done
+  
+  json_array+="]"
+  echo "$json_array"
+}
+
+# Function to get available devices for attachment (non-attached devices)
+get_available_devices() {
+  # Get currently attached devices for filtering
+  local attached=()
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && attached+=("$line")
+  done < <(get_attached_devices)
+  local attached_ids=()
+  for device in "${attached[@]}"; do
+    IFS='|' read -r vendor product name status <<< "$device"
+    attached_ids+=("$vendor:$product")
+  done
+
+  local available_devices=()
+  while read -r line; do
+    if [[ $line =~ Bus\ ([0-9]+)\ Device\ ([0-9]+):\ ID\ ([0-9a-fA-F]+):([0-9a-fA-F]+)\ (.*) ]]; then
+      bus="${BASH_REMATCH[1]}"
+      dev="${BASH_REMATCH[2]}"
+      vendor="${BASH_REMATCH[3]}"
+      product="${BASH_REMATCH[4]}"
+      name="${BASH_REMATCH[5]}"
+      
+      # Skip hubs and root hubs
+      if [[ "$vendor" == "1d6b" || "$name" =~ "Hub" ]]; then
+        continue
+      fi
+      
+      # Skip already attached devices
+      local already_attached=false
+      for attached_id in "${attached_ids[@]}"; do
+        if [[ "$attached_id" == "$vendor:$product" ]]; then
+          already_attached=true
+          break
+        fi
+      done
+      
+      if [[ "$already_attached" == false ]]; then
+        available_devices+=("$vendor|$product|$name|Available")
+      fi
+    fi
+  done < <(lsusb)
+  
+  printf '%s\n' "${available_devices[@]}"
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --json)
+      JSON_OUTPUT=true
+      INTERACTIVE=false
+      shift
+      ;;
+    --list)
+      ACTION="list"
+      shift
+      ;;
+    --list-available)
+      ACTION="list-available"
+      shift
+      ;;
+    --attach)
+      ACTION="attach"
+      if [[ -n "$2" && "$2" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$ ]]; then
+        DEVICE_ID="$2"
+        INTERACTIVE=false
+        shift 2
+      else
+        shift
+      fi
+      ;;
+    --detach)
+      ACTION="detach"
+      if [[ -n "$2" && "$2" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$ ]]; then
+        DEVICE_ID="$2"
+        INTERACTIVE=false
+        shift 2
+      else
+        shift
+      fi
+      ;;
+    --reconnect)
+      ACTION="reconnect"
+      if [[ -n "$2" && "$2" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$ ]]; then
+        DEVICE_ID="$2"
+        INTERACTIVE=false
+        shift 2
+      else
+        shift
+      fi
+      ;;
+    --cleanup)
+      ACTION="cleanup"
+      shift
+      ;;
+    --help|-h)
+      ACTION="help"
+      shift
+      ;;
+    *)
+      output_error "Unknown option: $1"
+      exit 1
+      ;;
+  esac
+done
+
+# Default action if none specified
+if [ -z "$ACTION" ]; then
+  ACTION="help"
+fi
+
+# Main logic
+case "$ACTION" in
+  list)
+    list_attached
+    ;;
+  list-available)
+    list_available
+    ;;
+  attach)
+    if [ -n "$DEVICE_ID" ]; then
+      IFS=':' read -r vendor product <<< "$DEVICE_ID"
+      attach_device_by_id "$vendor" "$product"
+    else
+      attach_device
+    fi
+    ;;
+  detach)
+    if [ -n "$DEVICE_ID" ]; then
+      IFS=':' read -r vendor product <<< "$DEVICE_ID"
+      detach_device_by_id "$vendor" "$product"
+    else
+      detach_device
+    fi
+    ;;
+  reconnect)
+    if [ -n "$DEVICE_ID" ]; then
+      IFS=':' read -r vendor product <<< "$DEVICE_ID"
+      reconnect_device_by_id "$vendor" "$product"
+    else
+      mark_for_reconnection
+    fi
+    ;;
+  cleanup)
+    cleanup_duplicates
+    ;;
+  help)
+    echo "Usage: $0 [OPTIONS] [COMMAND] [DEVICE_ID]"
+    echo
+    echo "OPTIONS:"
+    echo "  --json                   Output in JSON format (can be combined with any command; implies non-interactive)"
+    echo "  --help, -h              Show this help message"
+    echo
+    echo "COMMANDS:"
+    echo "  --list                  Show attached USB devices"
+    echo "  --list-available        Show available USB devices for attachment"
+    echo "  --attach [DEVICE_ID]    Attach a USB device (interactive or by vendor:product ID)"
+    echo "  --detach [DEVICE_ID]    Detach a USB device (interactive or by vendor:product ID)"
+    echo "  --reconnect [DEVICE_ID] Reconnect a USB device (interactive or by vendor:product ID)"
+    echo "  --cleanup               Remove duplicate USB hostdev entries"
+    echo
+    echo "DEVICE_ID format: VENDOR:PRODUCT (e.g., 046d:c52b)"
+    echo
+    echo "You can add --json to any command for machine-readable output."
+    echo
+    echo "Examples:"
+    echo "  $0 --list --json                    # List attached devices in JSON"
+    echo "  $0 --list-available --json          # List available devices in JSON"
+    echo "  $0 --attach 046d:c52b --json        # Attach specific device, JSON output"
+    echo "  $0 --detach 046d:c52b --json        # Detach specific device, JSON output"
+    echo "  $0 --reconnect 046d:c52b --json     # Reconnect specific device, JSON output"
+    echo "  $0 --attach                         # Interactive attach"
+    echo
+    echo "Note: All device attachments/detachments are permanent and survive VM reboots."
+    exit 0
+    ;;
+  *)
+    output_error "Invalid action: $ACTION"
+    exit 1
+    ;;
+esac
